@@ -1,1 +1,1 @@
-$CC -mavx2 -O2 main.c -lX11 $@
+$CC -mavx2 main.c -lX11 -lm -lxcb -lXdmcp -lXau -o viewer $@

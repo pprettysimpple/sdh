@@ -1,5 +1,9 @@
-#include "X11/X.h"
+// x11
+#include <X11/X.h>
 #include <X11/Xlib.h>
+// m
+#include <fenv.h>
+// c
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -7,8 +11,11 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/mman.h>
-
 #include <x86intrin.h>
+
+#ifndef RENDER_GRADIENT // default is to render with gradient, does not require -mfma to work
+#define RENDER_GRADIENT 1
+#endif
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -114,14 +121,16 @@ RenderData_Init(i32 width, i32 height) {
     return rd;
 }
 
-#define MAX_ITERS 100
-u32 mandelbrot_pallete[MAX_ITERS]; // for scalar part
-u32 mandelbrot_pallete2[MAX_ITERS]; // for vectorized part
-
-#define ALIGN64 __attribute__((aligned(64)))
+#define MIN_ITERS 2
+#define MAX_ITERS 2000
+f32 limit_iters = 50; // current limit, may be changed
 
 void
 RenderData_MandelbrotIter(RenderData rd, f64 x0, f64 y0, f64 x1, f64 y1) {
+    #pragma STDC FENV_ACCESS ON
+    const int orig_rounding = fegetround();
+    fesetround(FE_UPWARD); // otherwise, second approach (without gradient) does not work and spits out NaNs
+
     f64 v_width = x1 - x0;
     f64 v_height = y1 - y0;
     for (i32 row = 0; row < rd.height; row++) {
@@ -141,27 +150,18 @@ RenderData_MandelbrotIter(RenderData rd, f64 x0, f64 y0, f64 x1, f64 y1) {
                     base_x + diff_x * 5.0,
                     base_x + diff_x * 6.0,
                     base_x + diff_x * 7.0);
-                f64 base_y = (f64)row / rd.height * v_height + y0;
-                f64 diff_y = (1.0 / rd.height) * v_height;
-                __m256 y_start = _mm256_set_ps(
-                    base_y + diff_y * 7.0, // 0 7
-                    base_y + diff_y * 6.0, // 1 6
-                    base_y + diff_y * 5.0, // 2 5
-                    base_y + diff_y * 4.0, // 3 4
-                    base_y + diff_y * 3.0, // 4 3
-                    base_y + diff_y * 2.0, // 5 2
-                    base_y + diff_y * 1.0, // 6 1
-                    base_y + diff_y * 0.0); // 7 0
+                __m256 y_start = _mm256_set1_ps((f64)row / rd.height * v_height + y0);
 
                 __m256 x = x_start;
                 __m256 y = y_start;
 
                 __m256 stopper = _mm256_set1_ps(4.0);
+
+#if RENDER_GRADIENT
                 i32 i = 0;
-                
                 __m256 stored_iters = (__m256)_mm256_set1_epi32(0);
 
-                while (i < MAX_ITERS) {
+                while (i < limit_iters) {
                     __m256 x2 = _mm256_mul_ps(x, x); // x2 = x * x
                     __m256 y2 = _mm256_mul_ps(y, y); // y2 = y * y
                     __m256 sum = _mm256_add_ps(x2, y2); // sum = x2 + y2
@@ -192,27 +192,53 @@ RenderData_MandelbrotIter(RenderData rd, f64 x0, f64 y0, f64 x1, f64 y1) {
                     i++;
                 }
 
-                // __m256 cmp_x = _mm256_cmp_ps(x, _mm256_set1_ps(0), _CMP_NEQ_OQ);
-                // __m256 cmp_y = _mm256_cmp_ps(y, _mm256_set1_ps(0), _CMP_NEQ_OQ);
-                // __m256 cmp = _mm256_or_ps(cmp_x, cmp_y);
-                // __m256 masked_idx = _mm256_and_ps(cmp, _mm256_set1_epi32(MAX_ITERS - 1));
-                // stored_iters = _mm256_or_ps(stored_iters, masked_idx);
+                __m256 cmp_x = _mm256_cmp_ps(x, _mm256_set1_ps(0), _CMP_NEQ_OQ);
+                __m256 cmp_y = _mm256_cmp_ps(y, _mm256_set1_ps(0), _CMP_NEQ_OQ);
+                __m256 cmp = _mm256_or_ps(cmp_x, cmp_y);
+                __m256 masked_idx = _mm256_and_ps(cmp, (__m256)_mm256_set1_epi32(limit_iters - 1));
+                stored_iters = _mm256_or_ps(stored_iters, masked_idx);
 
-                f32 packed_iters[8] ALIGN64;
-                _mm256_store_ps(packed_iters, stored_iters);
+                f32 packed_iters[8] __attribute__((aligned(64)));
+                _mm256_store_ps(packed_iters, stored_iters); // aligned store
                 
-                for (i32 i = 0; i < 8; i++) { // may be optimizes with scatter ops, but they are avx512 only :(
+                for (i32 i = 0; i < 8; i++) {
                     i32 iters = ((i32*)packed_iters)[7 - i];
-                    u32 color = mandelbrot_pallete2[iters];
-                    // printf("idx: %d color %d\n", iters, color);
+                    u32 color = MixColor(0, (f32)iters / limit_iters * 255, 0);
                     *(dst + i) = color;
                 }
+
+#else
+                // So, here we do not store gradient of anything, just simply checking if we are outside or not at the end
+                for (i32 i = 0; i < limit_iters; i++) {
+                    __m256 y2 = _mm256_mul_ps(y, y);
+
+                    __m256 tmp = _mm256_add_ps(_mm256_fmsub_ps(x, x, y2), x_start);
+                    __m256 xy = _mm256_mul_ps(x, y);
+                    y = _mm256_add_ps(_mm256_add_ps(xy, xy), y_start);
+                    x = tmp;
+
+                    i++;
+                }
+
+                __m256 x2 = _mm256_mul_ps(x, x);
+                __m256 y2 = _mm256_mul_ps(y, y);
+                __m256 sum = _mm256_add_ps(x2, y2);
+                __m256 cmp = _mm256_cmp_ps(sum, stopper, _CMP_GT_OQ);
+
+                u32 packed_iters[8] __attribute__((aligned(64)));
+                _mm256_store_ps((f32*)packed_iters, cmp); // aligned store
+                
+                for (i32 i = 0; i < 8; i++) {
+                    u32 iters = (packed_iters)[7 - i];
+                    u32 color = MixColor(0, (iters > 0 ? 255 : 0), 0);
+                    *(dst + i) = color;
+                }
+#endif
 
                 col += 8;
                 continue;
             }
 
-            // calc mndlbrt value
             f32 x_start = (f32)col / rd.width * v_width + x0;
             f32 y_start = (f32)row / rd.height * v_height + y0;
             f32 x = x_start;
@@ -221,7 +247,7 @@ RenderData_MandelbrotIter(RenderData rd, f64 x0, f64 y0, f64 x1, f64 y1) {
             while (1) {
                 f32 x2 = x * x;
                 f32 y2 = y * y;
-                if (x2 + y2 >= 4 || iters + 1 >= MAX_ITERS) {
+                if (x2 + y2 > 4 || iters + 1 >= limit_iters) {
                     break;
                 }
                 f32 tmp = x2 - y2 + x_start;
@@ -230,12 +256,14 @@ RenderData_MandelbrotIter(RenderData rd, f64 x0, f64 y0, f64 x1, f64 y1) {
                 iters++;
             }
 
-            u32 color = mandelbrot_pallete[iters];
+            u32 color = MixColor(0, (f32)iters / limit_iters * 255, 0);
             *dst = color;
 
             col++;
         }
     }
+
+    fesetround(orig_rounding);
 }
 
 void
@@ -255,13 +283,6 @@ RenderData_Deinit(RenderData rd) {
 
 i32 main() {
     clock_getcpuclockid(getpid(), &system_clock);
-
-    for (i32 i = 0; i < MAX_ITERS; i++) {
-        mandelbrot_pallete[i] = MixColor(0, (f32)i / MAX_ITERS * 255, 0);
-    }
-    for (i32 i = 0; i < MAX_ITERS; i++) {
-        mandelbrot_pallete2[i] = MixColor(0, 0, (f32)i / MAX_ITERS * 255);
-    }
 
     Display* d = XOpenDisplay(0);
     if (d == 0) {
@@ -299,6 +320,7 @@ i32 main() {
     state.speed_y = 1.0;
 
     state.running = 1;
+    printf("\n"); // for status-row
     while (state.running) {
         XEvent e;
         while (state.running && XCheckWindowEvent(d, w, mask, &e)) {
@@ -321,19 +343,29 @@ i32 main() {
         f32 dt = FrameTimer_NextFrame(&ft);
         frame_counter++;
 
-        if (keyboard.keys[25]) { // W
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("W"))]) {
             state.pos_y += state.speed_y * dt;
         }
-        if (keyboard.keys[38]) { // A
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("A"))]) {
             state.pos_x -= state.speed_x * dt;
         }
-        if (keyboard.keys[39]) { // S
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("S"))]) {
             state.pos_y -= state.speed_y * dt;
         }
-        if (keyboard.keys[40]) { // D
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("D"))]) {
             state.pos_x += state.speed_x * dt;
         }
-        if (keyboard.keys[27]) { // R
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("E"))]) {
+            limit_iters += dt * 50;
+        }
+
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("Q"))]) {
+            limit_iters -= dt * 50;
+        }
+        if (limit_iters < MIN_ITERS) limit_iters = MIN_ITERS;
+        if (limit_iters > MAX_ITERS) limit_iters = MAX_ITERS;
+
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("R"))]) {
             state.pos_x += state.width * 0.1 / 2.0;
             state.pos_y -= state.height * 0.1 / 2.0;
             state.width *= 0.9;
@@ -341,7 +373,7 @@ i32 main() {
             state.speed_x *= 0.9;
             state.speed_y *= 0.9;
         }
-        if (keyboard.keys[41]) { // F
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("F"))]) {
             state.pos_x -= state.width * (0.1 / 0.9) / 2.0;
             state.pos_y += state.height * (0.1 / 0.9) / 2.0;
             state.width /= 0.9;
@@ -349,15 +381,29 @@ i32 main() {
             state.speed_x /= 0.9;
             state.speed_y /= 0.9;
         }
-        if (keyboard.keys[24] || keyboard.keys[9]) { // Q || Esc
+
+        if (keyboard.keys[XKeysymToKeycode(d, XStringToKeysym("Escape"))]) {
             state.running = 0;
             break;
         }
 
-        // RenderData_Fill(rd, MixColor(frame_counter, 0, 0));
         RenderData_MandelbrotIter(rd, state.pos_x, state.pos_y, state.pos_x + state.width, state.pos_y - state.height);
-        // XPutImage(d, pm, gc, image, 0,0,0,0, rd.width, rd.height);
         XPutImage(d, w, gc, image, 0,0,0,0, rd.width, rd.height);
         XSync(d, 0);
+
+        // scratch-code for debug output on each second
+        static f32 last_fps_printed = 0;
+        static u32 frames_in_sec = 0;
+        if (last_fps_printed == 0) last_fps_printed = nowf();
+
+        f32 now = nowf();
+        if (now - last_fps_printed > 1.0) {
+            printf("\rFPS: %d, scale: (%f, %f) (%f, %f)", frames_in_sec, state.pos_x, state.pos_y, state.pos_x + state.width, state.pos_y - state.height);
+            fflush(stdout);
+            frames_in_sec = 1;
+            last_fps_printed = now;
+        } else {
+            frames_in_sec++;
+        }
     }
 }
