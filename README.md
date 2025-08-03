@@ -1,3 +1,5 @@
+# Cool fractal viewer (weekend project)
+
 Implementation requires avx2 support.
 
 To build:
