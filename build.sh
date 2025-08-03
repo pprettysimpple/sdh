@@ -1,0 +1,1 @@
+$CC -mavx2 -O2 main.c -lX11 $@
